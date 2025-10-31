@@ -12,6 +12,17 @@ struct {
   struct proc proc[NPROC];
 } ptable;
 
+// ==========================================
+// Ready Queue for Priority Scheduling (R2)
+// ==========================================
+#define NPROC 64
+struct proc* ready_queue[NPROC];
+int rq_size = 0;
+
+// Function prototypes
+void add_to_ready_queue(struct proc *p);
+struct proc* get_from_ready_queue(void);
+
 static struct proc *initproc;
 
 int nextpid = 1;
@@ -89,6 +100,12 @@ found:
   p->state = EMBRYO;
   p->pid = nextpid++;
 
+  // ==============================================
+  // Initialize default priority for new process
+  // ==============================================
+  p->priority = 10;  // smaller value = higher priority
+  // ==============================================
+
   release(&ptable.lock);
 
   // Allocate kernel stack.
@@ -114,6 +131,42 @@ found:
 
   return p;
 }
+
+// Add a process to the ready queue sorted by priority
+void
+add_to_ready_queue(struct proc *p)
+{
+  int i = rq_size - 1;
+
+  while (i >= 0 && (ready_queue[i]->priority > p->priority || 
+        (ready_queue[i]->priority == p->priority && ready_queue[i]->pid < p->pid))) 
+  {
+    ready_queue[i + 1] = ready_queue[i];
+    i--;
+  }
+
+  ready_queue[i + 1] = p;
+  rq_size++;
+}
+// Remove and return the highest-priority process from the ready queue
+struct proc*
+get_from_ready_queue(void)
+{
+  if (rq_size == 0)
+    return 0;
+
+  struct proc* p = ready_queue[0];
+
+  for (int i = 1; i < rq_size; i++)
+    ready_queue[i - 1] = ready_queue[i];
+
+  rq_size--;
+
+  return p;
+}
+
+
+
 
 //PAGEBREAK: 32
 // Set up first user process.
@@ -151,7 +204,7 @@ userinit(void)
   acquire(&ptable.lock);
 
   p->state = RUNNABLE;
-
+  add_to_ready_queue(p);
   release(&ptable.lock);
 }
 
@@ -213,11 +266,26 @@ fork(void)
   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
 
   pid = np->pid;
+  
+  // ===============================
+  // R1: Assign child process priority
+  // ===============================
+  if(curproc->priority >= 15)
+    np->priority = curproc->priority / 2;
+  else
+    np->priority = curproc->priority + 1;
+  // ===============================
+
 
   acquire(&ptable.lock);
 
   np->state = RUNNABLE;
-
+  add_to_ready_queue(np);  // <---- add new process into ready queue
+  if (np->priority < curproc->priority) {
+    curproc->state = RUNNABLE;
+    add_to_ready_queue(curproc);
+    sched();
+  }
   release(&ptable.lock);
 
   return pid;
@@ -327,35 +395,36 @@ scheduler(void)
   struct proc *p;
   struct cpu *c = mycpu();
   c->proc = 0;
-  
+
   for(;;){
-    // Enable interrupts on this processor.
+    // Enable interrupts on this processor
     sti();
 
-    // Loop over process table looking for process to run.
     acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
-        continue;
 
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
-      c->proc = p;
-      switchuvm(p);
-      p->state = RUNNING;
-
-      swtch(&(c->scheduler), p->context);
-      switchkvm();
-
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
-      c->proc = 0;
+    // Get the highest-priority process from the ready queue
+    p = get_from_ready_queue();
+    if(p == 0){
+      // No runnable process, release lock and retry
+      release(&ptable.lock);
+      continue;
     }
-    release(&ptable.lock);
 
+    // Switch to chosen process
+    c->proc = p;
+    switchuvm(p);
+    p->state = RUNNING;
+
+    swtch(&(c->scheduler), p->context);
+    switchkvm();
+
+    // Process is done running for now.
+    c->proc = 0;
+
+    release(&ptable.lock);
   }
 }
+
 
 // Enter scheduler.  Must hold only ptable.lock
 // and have changed proc->state. Saves and restores
@@ -389,6 +458,7 @@ yield(void)
 {
   acquire(&ptable.lock);  //DOC: yieldlock
   myproc()->state = RUNNABLE;
+  add_to_ready_queue(myproc());  // <---- reinsert current process into queue
   sched();
   release(&ptable.lock);
 }
@@ -461,9 +531,12 @@ wakeup1(void *chan)
 {
   struct proc *p;
 
-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
-    if(p->state == SLEEPING && p->chan == chan)
-      p->state = RUNNABLE;
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+  if(p->state == SLEEPING && p->chan == chan){
+    p->state = RUNNABLE;
+    add_to_ready_queue(p);  // <---- wake up process goes back to queue
+    }
+  }
 }
 
 // Wake up all processes sleeping on chan.
@@ -546,6 +619,13 @@ setnice(int pid, int nice)
   for( p = ptable.proc; p < &ptable.proc[NPROC]; p++){
     if(p->pid==pid){
       p->priority = nice;
+      
+      if (p == myproc()) {
+        p->state = RUNNABLE;
+        add_to_ready_queue(p);
+        sched();
+      }
+
       release(&ptable.lock);
       return 0;
     }
