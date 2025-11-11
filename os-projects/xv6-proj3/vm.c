@@ -318,25 +318,50 @@ copyuvm(pde_t *pgdir, uint sz)
   pde_t *d;
   pte_t *pte;
   uint pa, i, flags;
-  char *mem;
+  // char *mem; // We don't need 'mem' anymore
 
   if((d = setupkvm()) == 0)
     return 0;
+  
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
       panic("copyuvm: pte should exist");
     if(!(*pte & PTE_P))
       panic("copyuvm: page not present");
+    
     pa = PTE_ADDR(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto bad;
-    memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
-      goto bad;
+
+    // --- Start of CoW modifications ---
+
+    // 1. Increment ref count for the shared physical page
+    inc_refcount(pa);
+
+    // 2. Map the same physical page into the child's page table, but as read-only
+    if(mappages(d, (void*)i, PGSIZE, pa, (flags & ~PTE_W)) < 0) {
+      goto bad; // Use goto bad for error handling
     }
+
+    // 3. Mark the page as read-only in the parent's page table as well
+    *pte &= ~PTE_W;
+
+    // --- End of CoW modifications ---
+
+    /* * The original code is removed:
+     *
+     * if((mem = kalloc()) == 0)
+     * goto bad;
+     * memmove(mem, (char*)P2V(pa), PGSIZE);
+     * if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
+     * kfree(mem);
+     * goto bad;
+     * }
+     */
   }
+
+  // Flush the parent's TLB because we modified its PTEs
+  lcr3(V2P(pgdir));
+
   return d;
 
 bad:
@@ -388,13 +413,57 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
 void
 page_fault(void)
 {
-  uint va = rcr2();
-  if(va < 0) {
-    panic("Invalid access");
+  uint va = rcr2(); // Get the virtual address that caused the fault
+  struct proc *curproc = myproc();
+  pte_t *pte;
+  uint pa;
+  char *mem;
+  uint flags;
+
+  // Check if the faulting address is valid (below KERNBASE)
+  if(va >= KERNBASE) {
+    panic("page_fault: invalid access (>= KERNBASE)");
     return;
   }
-  
-  return;
+
+  // Get the PTE for the faulting address
+  pte = walkpgdir(curproc->pgdir, (void*)va, 0);
+  if(pte == 0 || !(*pte & PTE_P) || !(*pte & PTE_U)) {
+    panic("page_fault: invalid pte");
+    return;
+  }
+
+  pa = PTE_ADDR(*pte); // Get the physical address
+  flags = PTE_FLAGS(*pte);
+
+  // Check reference count
+  if(get_refcount(pa) > 1) {
+    // Case 1: Shared page (ref_count > 1), need to copy
+    
+    // Allocate a new page
+    mem = kalloc();
+    if(mem == 0) {
+      panic("page_fault: kalloc out of memory");
+      return;
+    }
+    
+    // Copy the content of the old page to the new page
+    memmove(mem, (char*)P2V(pa), PGSIZE);
+
+    // Decrement the reference count of the old physical page
+    dec_refcount(pa);
+
+    // Update the PTE to point to the new page, with write permissions
+    *pte = V2P(mem) | (flags | PTE_W);
+
+  } else if (get_refcount(pa) == 1) {
+    // Case 2: Not a shared page (ref_count == 1)
+    // Just make the page writable
+    *pte |= PTE_W;
+  }
+
+  // Flush the TLB
+  lcr3(V2P(curproc->pgdir));
 }
 
 //PAGEBREAK!
